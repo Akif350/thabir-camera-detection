@@ -6,6 +6,7 @@ class StreamMonitor {
   constructor() {
     this.isRunning = false;
     this.cronJob = null;
+    this.isInitialCheckComplete = false;
   }
 
   /**
@@ -20,16 +21,20 @@ class StreamMonitor {
     this.isRunning = true;
     console.log('[Monitor] Starting stream monitor...');
 
-    // Check every 15 seconds for faster recovery (24/7 streaming guarantee)
-    this.cronJob = cron.schedule('*/15 * * * * *', async () => {
-      await this.checkAllStreams();
+    // Check every 30 seconds (increased from 15 to reduce interference)
+    this.cronJob = cron.schedule('*/30 * * * * *', async () => {
+      // Only run regular checks after initial check is complete
+      if (this.isInitialCheckComplete) {
+        await this.checkAllStreams();
+      }
     });
 
-    // Initial check immediately and then every 15 seconds
-    // Immediate check ensures streams start right away
-    setTimeout(() => {
-      this.checkAllStreams();
-    }, 2000); // Reduced to 2 seconds for faster startup
+    // Initial check after a delay to let the system stabilize
+    setTimeout(async () => {
+      await this.checkAllStreams();
+      this.isInitialCheckComplete = true;
+      console.log('[Monitor] Initial check complete, now monitoring every 30 seconds');
+    }, 5000); // Wait 5 seconds before first check
   }
 
   /**
@@ -53,18 +58,32 @@ class StreamMonitor {
       
       for (const camera of cameras) {
         const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
+        const isStarting = ffmpegManager.isStreamStarting(camera.streamName);
         
         // Update last checked time
         camera.lastChecked = Date.now();
         
+        // Skip if stream is currently starting up
+        if (isStarting) {
+          console.log(`[Monitor] ⏳ Stream ${camera.streamName} is starting, skipping check`);
+          continue;
+        }
+        
         if (!isRunning && camera.active) {
-          console.log(`[Monitor] ⚠️ Stream ${camera.streamName} is not running, restarting immediately...`);
+          console.log(`[Monitor] ⚠️ Stream ${camera.streamName} is not running, restarting...`);
           try {
-            // Force restart - ensure 24/7 streaming
-            await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-            console.log(`[Monitor] ✅ Stream ${camera.streamName} restarted successfully`);
-            // Update status
-            camera.streaming = true;
+            // Verify stream is actually not available before restarting
+            const isAvailable = await ffmpegManager.checkStreamAvailability(camera.streamName);
+            
+            if (!isAvailable) {
+              await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
+              console.log(`[Monitor] ✅ Stream ${camera.streamName} restart initiated`);
+              camera.streaming = true;
+            } else {
+              console.log(`[Monitor] ℹ️ Stream ${camera.streamName} is available despite process not found`);
+              camera.streaming = true;
+            }
+            
             camera.lastChecked = Date.now();
           } catch (error) {
             console.error(`[Monitor] ❌ Failed to restart ${camera.streamName}:`, error.message);
@@ -97,21 +116,27 @@ class StreamMonitor {
       const cameras = await Camera.find({ active: true });
       console.log(`[Monitor] Found ${cameras.length} active cameras to restore`);
 
+      // Process cameras sequentially to avoid overwhelming the system
       for (const camera of cameras) {
         try {
           console.log(`[Monitor] 🔄 Restoring stream: ${camera.streamName}`);
+          
           // Check if already running
           if (!ffmpegManager.isStreamRunning(camera.streamName)) {
             await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-            console.log(`[Monitor] ✅ Restored stream: ${camera.streamName}`);
+            console.log(`[Monitor] ✅ Stream restoration started: ${camera.streamName}`);
+            
+            // Longer delay between starts to ensure each stream has time to initialize
+            await new Promise(resolve => setTimeout(resolve, 3000));
           } else {
             console.log(`[Monitor] ℹ️ Stream ${camera.streamName} already running`);
           }
-          // Small delay between starts to avoid overwhelming the system
-          await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (error) {
           console.error(`[Monitor] ❌ Failed to restore ${camera.streamName}:`, error.message);
           console.log(`[Monitor] Will retry in monitor cycle`);
+          
+          // Continue with next camera even if this one failed
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
 
@@ -123,4 +148,3 @@ class StreamMonitor {
 }
 
 module.exports = new StreamMonitor();
-
