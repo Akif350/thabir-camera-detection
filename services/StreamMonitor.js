@@ -20,15 +20,16 @@ class StreamMonitor {
     this.isRunning = true;
     console.log('[Monitor] Starting stream monitor...');
 
-    // Check every 30 seconds
-    this.cronJob = cron.schedule('*/30 * * * * *', async () => {
+    // Check every 15 seconds for faster recovery (24/7 streaming guarantee)
+    this.cronJob = cron.schedule('*/15 * * * * *', async () => {
       await this.checkAllStreams();
     });
 
-    // Initial check after 5 seconds
+    // Initial check immediately and then every 15 seconds
+    // Immediate check ensures streams start right away
     setTimeout(() => {
       this.checkAllStreams();
-    }, 5000);
+    }, 2000); // Reduced to 2 seconds for faster startup
   }
 
   /**
@@ -57,12 +58,19 @@ class StreamMonitor {
         camera.lastChecked = Date.now();
         
         if (!isRunning && camera.active) {
-          console.log(`[Monitor] Stream ${camera.streamName} is not running, restarting...`);
+          console.log(`[Monitor] ⚠️ Stream ${camera.streamName} is not running, restarting immediately...`);
           try {
+            // Force restart - ensure 24/7 streaming
             await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-            console.log(`[Monitor] Stream ${camera.streamName} restarted successfully`);
+            console.log(`[Monitor] ✅ Stream ${camera.streamName} restarted successfully`);
+            // Update status
+            camera.streaming = true;
+            camera.lastChecked = Date.now();
           } catch (error) {
-            console.error(`[Monitor] Failed to restart ${camera.streamName}:`, error.message);
+            console.error(`[Monitor] ❌ Failed to restart ${camera.streamName}:`, error.message);
+            console.log(`[Monitor] Will retry in next check cycle`);
+            camera.streaming = false;
+            camera.lastChecked = Date.now();
           }
         } else if (isRunning) {
           // Update streaming status
@@ -91,12 +99,19 @@ class StreamMonitor {
 
       for (const camera of cameras) {
         try {
-          console.log(`[Monitor] Restoring stream: ${camera.streamName}`);
-          await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-          // Small delay between starts
+          console.log(`[Monitor] 🔄 Restoring stream: ${camera.streamName}`);
+          // Check if already running
+          if (!ffmpegManager.isStreamRunning(camera.streamName)) {
+            await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
+            console.log(`[Monitor] ✅ Restored stream: ${camera.streamName}`);
+          } else {
+            console.log(`[Monitor] ℹ️ Stream ${camera.streamName} already running`);
+          }
+          // Small delay between starts to avoid overwhelming the system
           await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (error) {
-          console.error(`[Monitor] Failed to restore ${camera.streamName}:`, error.message);
+          console.error(`[Monitor] ❌ Failed to restore ${camera.streamName}:`, error.message);
+          console.log(`[Monitor] Will retry in monitor cycle`);
         }
       }
 

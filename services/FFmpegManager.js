@@ -27,6 +27,12 @@ class FFmpegManager {
       '-hide_banner',
       '-loglevel', 'warning',  // Changed from 'info' to reduce noise
       '-rtsp_transport', 'tcp',
+      '-rtsp_flags', 'prefer_tcp',
+      '-stimeout', '5000000',  // 5 second timeout for RTSP connection
+      '-reconnect', '1',
+      '-reconnect_at_eof', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '2',
       '-fflags', '+genpts+nobuffer',
       '-use_wallclock_as_timestamps', '1',
       '-allowed_media_types', 'video',  // Only process video
@@ -118,29 +124,70 @@ class FFmpegManager {
           console.error(`[FFmpeg ${streamName}] Error updating database:`, error.message);
         }
 
-        // Auto-restart if not shutting down
-        if (!this.isShuttingDown && code !== 0) {
-          console.log(`[FFmpeg ${streamName}] Auto-restarting in 2 seconds...`);
-          processInfo.restartCount++;
+        // Auto-restart if not shutting down - ALWAYS restart to ensure 24/7 streaming
+        if (!this.isShuttingDown) {
+          const maxRetries = 10; // Maximum retry attempts
+          const retryDelay = Math.min(2000 * Math.pow(1.5, processInfo.restartCount), 30000); // Exponential backoff, max 30s
           
+          if (processInfo.restartCount < maxRetries) {
+            console.log(`[FFmpeg ${streamName}] Auto-restarting in ${retryDelay/1000} seconds... (Attempt ${processInfo.restartCount + 1}/${maxRetries})`);
+            processInfo.restartCount++;
+            
+            setTimeout(async () => {
+              try {
+                const camera = await Camera.findOne({ streamName, active: true });
+                if (camera) {
+                  console.log(`[FFmpeg ${streamName}] 🔄 Restarting stream (attempt ${processInfo.restartCount})...`);
+                  await this.startStream(camera.rtspUrl, streamName);
+                } else {
+                  console.log(`[FFmpeg ${streamName}] Camera not found or inactive, stopping retries`);
+                }
+              } catch (error) {
+                console.error(`[FFmpeg ${streamName}] Restart failed:`, error.message);
+                // Will be retried by StreamMonitor
+              }
+            }, retryDelay);
+          } else {
+            console.error(`[FFmpeg ${streamName}] Max retries reached, StreamMonitor will handle restart`);
+            // StreamMonitor will pick this up and restart
+          }
+        }
+      });
+
+      // Handle errors - don't reject immediately, try to restart
+      ffmpegProcess.on('error', async (error) => {
+        console.error(`[FFmpeg ${streamName}] Process error:`, error.message);
+        this.processes.delete(streamName);
+        
+        // Update database
+        try {
+          await Camera.updateOne(
+            { streamName },
+            { 
+              streaming: false,
+              processId: null,
+              lastChecked: Date.now()
+            }
+          );
+        } catch (dbError) {
+          console.error(`[FFmpeg ${streamName}] DB update error:`, dbError.message);
+        }
+        
+        // Auto-restart on error if not shutting down
+        if (!this.isShuttingDown) {
           setTimeout(async () => {
             try {
               const camera = await Camera.findOne({ streamName, active: true });
               if (camera) {
-                console.log(`[FFmpeg ${streamName}] Restarting stream...`);
+                console.log(`[FFmpeg ${streamName}] 🔄 Restarting after error...`);
                 await this.startStream(camera.rtspUrl, streamName);
               }
-            } catch (error) {
-              console.error(`[FFmpeg ${streamName}] Restart failed:`, error.message);
+            } catch (restartError) {
+              console.error(`[FFmpeg ${streamName}] Error restart failed:`, restartError.message);
             }
-          }, 2000);
+          }, 3000);
         }
-      });
-
-      // Handle errors
-      ffmpegProcess.on('error', (error) => {
-        console.error(`[FFmpeg ${streamName}] Process error:`, error.message);
-        this.processes.delete(streamName);
+        
         reject(error);
       });
 

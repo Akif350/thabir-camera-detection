@@ -115,11 +115,16 @@ mongoose.connect(config.mongodbUri, {
     console.log(`[Server] Environment: ${config.nodeEnv}`);
     console.log(`[MediaMTX] Host: ${config.mediamtx.host}:${config.mediamtx.rtspPort}`);
     
-    // Restore all active streams on startup
+    // Restore all active streams on startup - CRITICAL for 24/7 streaming
     streamMonitor.restoreStreams().then(() => {
-      // Start monitoring after restoration
+      // Start monitoring after restoration - ensures streams never stop
       streamMonitor.start();
-      console.log('[Monitor] Stream monitoring started');
+      console.log('[Monitor] ✅ Stream monitoring started - 24/7 streaming enabled');
+      console.log('[Monitor] Streams will auto-restart every 15 seconds if stopped');
+    }).catch((error) => {
+      console.error('[Monitor] Error starting monitor:', error);
+      // Still start monitoring even if restore fails
+      streamMonitor.start();
     });
   });
 })

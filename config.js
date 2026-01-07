@@ -40,10 +40,11 @@ module.exports = {
       return `rtsp://${this.host}:${this.rtspPort}`;
     },
     getPublicBase() {
-      // Use explicit protocol from env, or auto-detect for localhost
-      let protocol = this.protocol;
-      if (!protocol || protocol === 'auto') {
-        protocol = this.host.includes('localhost') || this.host.includes('127.0.0.1') ? 'http' : 'https';
+      // Use explicit protocol from env, default to http if not specified
+      let protocol = this.protocol || 'http';
+      // Only use https if explicitly set to 'https', otherwise use http
+      if (protocol !== 'https') {
+        protocol = 'http';
       }
       return `${protocol}://${this.host}:${this.httpPort}`;
     }
