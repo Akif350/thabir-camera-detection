@@ -6,7 +6,6 @@ class StreamMonitor {
   constructor() {
     this.isRunning = false;
     this.cronJob = null;
-    this.isInitialCheckComplete = false;
   }
 
   /**
@@ -21,20 +20,15 @@ class StreamMonitor {
     this.isRunning = true;
     console.log('[Monitor] Starting stream monitor...');
 
-    // Check every 30 seconds (increased from 15 to reduce interference)
-    this.cronJob = cron.schedule('*/30 * * * * *', async () => {
-      // Only run regular checks after initial check is complete
-      if (this.isInitialCheckComplete) {
-        await this.checkAllStreams();
-      }
+    // Check every 15 seconds
+    this.cronJob = cron.schedule('*/15 * * * * *', async () => {
+      await this.checkAllStreams();
     });
 
-    // Initial check after a delay to let the system stabilize
-    setTimeout(async () => {
-      await this.checkAllStreams();
-      this.isInitialCheckComplete = true;
-      console.log('[Monitor] Initial check complete, now monitoring every 30 seconds');
-    }, 5000); // Wait 5 seconds before first check
+    // Initial check after 5 seconds (give time for manual starts to stabilize)
+    setTimeout(() => {
+      this.checkAllStreams();
+    }, 5000);
   }
 
   /**
@@ -56,52 +50,67 @@ class StreamMonitor {
     try {
       const cameras = await Camera.find({ active: true });
       
+      console.log(`[Monitor] Checking ${cameras.length} active cameras...`);
+      
       for (const camera of cameras) {
         const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
-        const isStarting = ffmpegManager.isStreamStarting(camera.streamName);
+        const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
         
         // Update last checked time
         camera.lastChecked = Date.now();
         
-        // Skip if stream is currently starting up
-        if (isStarting) {
-          console.log(`[Monitor] ⏳ Stream ${camera.streamName} is starting, skipping check`);
-          continue;
-        }
-        
         if (!isRunning && camera.active) {
-          console.log(`[Monitor] ⚠️ Stream ${camera.streamName} is not running, restarting...`);
+          // Stream should be running but isn't
+          console.log(`[Monitor] ⚠️ Stream ${camera.streamName} is not running, restarting immediately...`);
+          console.log(`[Monitor] Camera DB state - streaming: ${camera.streaming}, processId: ${camera.processId}`);
+          
           try {
-            // Verify stream is actually not available before restarting
-            const isAvailable = await ffmpegManager.checkStreamAvailability(camera.streamName);
+            // Force restart
+            await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
+            console.log(`[Monitor] ✅ Stream ${camera.streamName} restart initiated`);
             
-            if (!isAvailable) {
-              await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-              console.log(`[Monitor] ✅ Stream ${camera.streamName} restart initiated`);
+            // Wait a bit for stream to stabilize before updating
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Re-check if stream is actually running now
+            const isNowRunning = ffmpegManager.isStreamRunning(camera.streamName);
+            const newProcessInfo = ffmpegManager.getProcessInfo(camera.streamName);
+            
+            if (isNowRunning && newProcessInfo) {
               camera.streaming = true;
+              camera.processId = newProcessInfo.process.pid;
+              console.log(`[Monitor] ✅ Stream ${camera.streamName} verified running with PID ${newProcessInfo.process.pid}`);
             } else {
-              console.log(`[Monitor] ℹ️ Stream ${camera.streamName} is available despite process not found`);
-              camera.streaming = true;
+              camera.streaming = false;
+              camera.processId = null;
+              console.log(`[Monitor] ⚠️ Stream ${camera.streamName} restart initiated but not yet verified`);
             }
-            
-            camera.lastChecked = Date.now();
           } catch (error) {
             console.error(`[Monitor] ❌ Failed to restart ${camera.streamName}:`, error.message);
-            console.log(`[Monitor] Will retry in next check cycle`);
             camera.streaming = false;
-            camera.lastChecked = Date.now();
+            camera.processId = null;
           }
-        } else if (isRunning) {
-          // Update streaming status
-          const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
-          if (processInfo && processInfo.process.pid) {
+        } else if (isRunning && processInfo) {
+          // Stream is running - verify and update status
+          if (!camera.streaming || camera.processId !== processInfo.process.pid) {
+            console.log(`[Monitor] 🔄 Updating status for ${camera.streamName} - was: streaming=${camera.streaming}, processId=${camera.processId}`);
             camera.streaming = true;
             camera.processId = processInfo.process.pid;
+            console.log(`[Monitor] ✅ Status updated - now: streaming=true, processId=${processInfo.process.pid}`);
+          }
+        } else if (!isRunning && !camera.active) {
+          // Camera is inactive and stream is not running - expected state
+          if (camera.streaming) {
+            camera.streaming = false;
+            camera.processId = null;
+            console.log(`[Monitor] 🔄 Updating inactive camera ${camera.streamName} status to not streaming`);
           }
         }
         
         await camera.save();
       }
+      
+      console.log(`[Monitor] Check completed. Active streams: ${ffmpegManager.getActiveStreams().length}`);
     } catch (error) {
       console.error('[Monitor] Error checking streams:', error.message);
     }
@@ -116,7 +125,6 @@ class StreamMonitor {
       const cameras = await Camera.find({ active: true });
       console.log(`[Monitor] Found ${cameras.length} active cameras to restore`);
 
-      // Process cameras sequentially to avoid overwhelming the system
       for (const camera of cameras) {
         try {
           console.log(`[Monitor] 🔄 Restoring stream: ${camera.streamName}`);
@@ -124,25 +132,78 @@ class StreamMonitor {
           // Check if already running
           if (!ffmpegManager.isStreamRunning(camera.streamName)) {
             await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-            console.log(`[Monitor] ✅ Stream restoration started: ${camera.streamName}`);
+            console.log(`[Monitor] ✅ Restore initiated for: ${camera.streamName}`);
             
-            // Longer delay between starts to ensure each stream has time to initialize
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            // Wait for stream to stabilize
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Verify
+            const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
+            const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
+            
+            if (isRunning && processInfo) {
+              camera.streaming = true;
+              camera.processId = processInfo.process.pid;
+              await camera.save();
+              console.log(`[Monitor] ✅ Stream ${camera.streamName} verified running with PID ${processInfo.process.pid}`);
+            } else {
+              console.log(`[Monitor] ⚠️ Stream ${camera.streamName} initiated but not yet verified`);
+            }
           } else {
             console.log(`[Monitor] ℹ️ Stream ${camera.streamName} already running`);
+            const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
+            if (processInfo) {
+              camera.streaming = true;
+              camera.processId = processInfo.process.pid;
+              await camera.save();
+            }
           }
+          
+          // Small delay between starts
+          await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (error) {
           console.error(`[Monitor] ❌ Failed to restore ${camera.streamName}:`, error.message);
-          console.log(`[Monitor] Will retry in monitor cycle`);
-          
-          // Continue with next camera even if this one failed
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          camera.streaming = false;
+          camera.processId = null;
+          await camera.save();
         }
       }
 
       console.log('[Monitor] Stream restoration completed');
     } catch (error) {
       console.error('[Monitor] Error restoring streams:', error.message);
+    }
+  }
+
+  /**
+   * Force refresh status for all cameras from actual process state
+   */
+  async forceRefreshStatus() {
+    console.log('[Monitor] Force refreshing camera statuses...');
+    try {
+      const cameras = await Camera.find({ active: true });
+      
+      for (const camera of cameras) {
+        const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
+        const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
+        
+        if (isRunning && processInfo) {
+          camera.streaming = true;
+          camera.processId = processInfo.process.pid;
+        } else {
+          camera.streaming = false;
+          camera.processId = null;
+        }
+        
+        camera.lastChecked = Date.now();
+        await camera.save();
+        
+        console.log(`[Monitor] Updated ${camera.streamName}: streaming=${camera.streaming}, PID=${camera.processId}`);
+      }
+      
+      console.log('[Monitor] Status refresh completed');
+    } catch (error) {
+      console.error('[Monitor] Error refreshing status:', error.message);
     }
   }
 }
