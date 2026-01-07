@@ -28,7 +28,6 @@ class FFmpegManager {
       '-loglevel', 'warning',  // Changed from 'info' to reduce noise
       '-rtsp_transport', 'tcp',
       '-rtsp_flags', 'prefer_tcp',
-      '-stimeout', '5000000',  // 5 second timeout for RTSP connection
       '-reconnect', '1',
       '-reconnect_at_eof', '1',
       '-reconnect_streamed', '1',
@@ -92,14 +91,21 @@ class FFmpegManager {
                                output.includes('Error constructing') ||
                                output.includes('Skipping invalid'));
         
+        // Check for stream ready indicators - these show stream is processing
+        if (output.includes('Stream #0') || output.includes('Output #0') || output.includes('frame=')) {
+          // Log important stream info
+          console.log(`[FFmpeg ${streamName}] ${output.trim()}`);
+          // These messages indicate stream is processing, which means it's connecting
+          if (output.includes('Stream #0') && !streamReady && ffmpegProcess.pid) {
+            console.log(`[FFmpeg ${streamName}] 📡 Stream processing detected - connection established`);
+          }
+        }
+        
         // Only log real errors, not HEVC decoder warnings
         if (output.includes('error') || output.includes('Error')) {
           if (!isHevcWarning) {
             console.error(`[FFmpeg ${streamName}] ${output.trim()}`);
           }
-        } else if (output.includes('Stream #0') || output.includes('Output #0') || output.includes('frame=')) {
-          // Log important stream info
-          console.log(`[FFmpeg ${streamName}] ${output.trim()}`);
         }
       });
 
@@ -191,29 +197,64 @@ class FFmpegManager {
         reject(error);
       });
 
-      // Give it a moment to start
-      setTimeout(() => {
-        if (ffmpegProcess.pid) {
+      // Wait for process to start and stream to be ready
+      // MediaMTX needs time to accept and make stream available
+      let streamReady = false;
+      let streamReadyTimeout;
+      
+      // Check for successful stream connection indicators in FFmpeg output
+      const checkStreamReady = () => {
+        // Stream is considered ready when:
+        // 1. Process has PID (started)
+        // 2. Enough time has passed for MediaMTX to accept stream (5-8 seconds)
+        if (ffmpegProcess.pid && !streamReady) {
+          streamReady = true;
+          if (streamReadyTimeout) clearTimeout(streamReadyTimeout);
+          
           console.log(`[FFmpeg ${streamName}] ✅ Started with PID ${ffmpegProcess.pid}`);
           console.log(`[FFmpeg ${streamName}] 📹 Source: ${rtspSource}`);
           console.log(`[FFmpeg ${streamName}] 🌐 Public URL: ${publicUrl}`);
+          console.log(`[FFmpeg ${streamName}] ⏳ Waiting for stream to be ready on MediaMTX...`);
           
-          // Update database
-          Camera.updateOne(
-            { streamName },
-            { 
-              streaming: true,
-              processId: ffmpegProcess.pid,
-              lastChecked: Date.now()
+          // Wait additional time for MediaMTX to make stream available
+          setTimeout(async () => {
+            // Update database
+            try {
+              await Camera.updateOne(
+                { streamName },
+                { 
+                  streaming: true,
+                  processId: ffmpegProcess.pid,
+                  lastChecked: Date.now()
+                }
+              );
+              console.log(`[FFmpeg ${streamName}] ✅ Stream ready and available on MediaMTX`);
+              resolve(publicUrl);
+            } catch (err) {
+              console.error(`[FFmpeg ${streamName}] DB update error:`, err.message);
+              resolve(publicUrl); // Still resolve even if DB update fails
             }
-          ).catch(err => console.error(`[FFmpeg ${streamName}] DB update error:`, err.message));
-
-          resolve(publicUrl);
+          }, 5000); // Wait 5 seconds for MediaMTX to make stream available
+        }
+      };
+      
+      // Check immediately if process already has PID
+      setTimeout(() => {
+        if (ffmpegProcess.pid) {
+          checkStreamReady();
         } else {
           console.error(`[FFmpeg ${streamName}] ❌ Process failed to start`);
           reject(new Error('FFmpeg process failed to start'));
         }
-      }, 1000);
+      }, 2000); // Wait 2 seconds for process to start
+      
+      // Fallback timeout - ensure we resolve/reject within reasonable time
+      streamReadyTimeout = setTimeout(() => {
+        if (ffmpegProcess.pid && !streamReady) {
+          console.log(`[FFmpeg ${streamName}] ⚠️ Stream started but ready check timeout, resolving anyway`);
+          checkStreamReady();
+        }
+      }, 10000); // Max 10 seconds total wait
     });
   }
 

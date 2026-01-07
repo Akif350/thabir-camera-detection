@@ -109,9 +109,10 @@ mongoose.connect(config.mongodbUri, {
   console.log('[MongoDB] ✅ Connected successfully to Atlas');
   console.log(`[MongoDB] Database: ${mongoose.connection.name}`);
   
-  // Start the server
-  app.listen(config.port, () => {
-    console.log(`[Server] Running on port ${config.port}`);
+  // Start the server - bind to 0.0.0.0 for Railway (accept external connections)
+  const host = '0.0.0.0'; // Listen on all interfaces for Railway
+  app.listen(config.port, host, () => {
+    console.log(`[Server] Running on ${host}:${config.port}`);
     console.log(`[Server] Environment: ${config.nodeEnv}`);
     console.log(`[MediaMTX] Host: ${config.mediamtx.host}:${config.mediamtx.rtspPort}`);
     
