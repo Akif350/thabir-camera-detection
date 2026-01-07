@@ -16,6 +16,9 @@ module.exports = {
   // Server
   port: process.env.PORT || 9001,
   nodeEnv: cleanEnv(process.env.NODE_ENV) || 'development',
+  baseUrl: cleanEnv(process.env.BASE_URL) || (process.env.NODE_ENV === 'production' 
+    ? 'https://thabir-camera-detection-production.up.railway.app' 
+    : `http://localhost:${process.env.PORT || 9001}`),
   
   // Database
   mongodbUri: cleanEnv(process.env.MONGODB_URI) || 'mongodb://localhost:27017/thabir',

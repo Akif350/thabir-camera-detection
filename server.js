@@ -38,8 +38,13 @@ app.get('/', (req, res) => {
     message: 'Thabir Streaming Server API',
     version: '1.0.0',
     status: 'running',
-    documentation: '/api-docs',
-    health: '/health'
+    baseUrl: config.baseUrl,
+    documentation: `${config.baseUrl}/api-docs`,
+    health: `${config.baseUrl}/health`,
+    api: {
+      addCamera: `${config.baseUrl}/api/camera/add`,
+      listCameras: `${config.baseUrl}/api/camera/list`
+    }
   });
 });
 
