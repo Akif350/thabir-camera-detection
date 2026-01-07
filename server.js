@@ -97,6 +97,10 @@ app.use((req, res) => {
 });
 
 // Connect to MongoDB
+console.log('[MongoDB] Attempting to connect...');
+console.log('[MongoDB] MONGODB_URI from env:', process.env.MONGODB_URI ? 'SET' : 'NOT SET');
+console.log('[MongoDB] Using URI:', config.mongodbUri.replace(/\/\/[^:]+:[^@]+@/, '//***:***@')); // Hide password in logs
+
 mongoose.connect(config.mongodbUri, {
   useNewUrlParser: true,
   useUnifiedTopology: true
