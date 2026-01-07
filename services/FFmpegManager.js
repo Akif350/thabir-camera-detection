@@ -216,7 +216,9 @@ class FFmpegManager {
           console.log(`[FFmpeg ${streamName}] 🌐 Public URL: ${publicUrl}`);
           console.log(`[FFmpeg ${streamName}] ⏳ Waiting for stream to be ready on MediaMTX...`);
           
-          // Wait additional time for MediaMTX to make stream available
+          // Wait longer for MediaMTX to make stream available (8 seconds total)
+          // MediaMTX needs time to accept RTSP push and make HTTP stream available
+          // MediaMTX needs time to accept RTSP push and make HTTP stream available
           setTimeout(async () => {
             // Update database
             try {
@@ -229,12 +231,14 @@ class FFmpegManager {
                 }
               );
               console.log(`[FFmpeg ${streamName}] ✅ Stream ready and available on MediaMTX`);
+              console.log(`[FFmpeg ${streamName}] 📺 Stream should be accessible at: ${publicUrl}`);
+              console.log(`[FFmpeg ${streamName}] ⏰ Note: If stream not found, wait 2-3 more seconds and refresh`);
               resolve(publicUrl);
             } catch (err) {
               console.error(`[FFmpeg ${streamName}] DB update error:`, err.message);
               resolve(publicUrl); // Still resolve even if DB update fails
             }
-          }, 5000); // Wait 5 seconds for MediaMTX to make stream available
+          }, 8000); // Wait 8 seconds for MediaMTX to make stream available (increased from 5)
         }
       };
       
