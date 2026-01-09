@@ -329,14 +329,43 @@ class FFmpegManager {
       console.log(`[FFmpeg] Stopping stream ${streamName} (PID: ${processInfo.process.pid})`);
       
       try {
-        processInfo.process.kill('SIGTERM');
+        // Try graceful shutdown first
+        if (processInfo.process && !processInfo.process.killed) {
+          processInfo.process.kill('SIGTERM');
+          
+          // Wait up to 3 seconds for graceful shutdown
+          let killed = false;
+          const killTimeout = setTimeout(() => {
+            if (!killed) {
+              try {
+                process.kill(processInfo.process.pid, 'SIGKILL');
+                console.log(`[FFmpeg] Force killed process ${processInfo.process.pid} for ${streamName}`);
+              } catch (err) {
+                // Process already dead
+              }
+            }
+          }, 3000);
+          
+          processInfo.process.once('exit', () => {
+            killed = true;
+            clearTimeout(killTimeout);
+          });
+        }
       } catch (err) {
         console.error(`[FFmpeg] Error killing process:`, err.message);
+        // Try force kill
+        try {
+          if (processInfo.process && processInfo.process.pid) {
+            process.kill(processInfo.process.pid, 'SIGKILL');
+          }
+        } catch (killErr) {
+          // Process already dead, ignore
+        }
       }
       
       this.processes.delete(streamName);
       
-      // Update database
+      // Update database - mark stream as stopped
       try {
         await Camera.updateOne(
           { streamName },
@@ -346,9 +375,9 @@ class FFmpegManager {
             lastChecked: Date.now()
           }
         );
-        console.log(`[FFmpeg] Database updated for ${streamName}: streaming = false`);
+        console.log(`[FFmpeg] ✅ Database updated for ${streamName}: streaming = false`);
       } catch (err) {
-        console.error(`[FFmpeg] DB update error:`, err.message);
+        console.error(`[FFmpeg] ❌ DB update error:`, err.message);
       }
       
       return true;
@@ -361,15 +390,46 @@ class FFmpegManager {
    * Stop all streams
    */
   async stopAll() {
-    console.log('[FFmpeg] Stopping all streams...');
+    console.log('[FFmpeg] ════════════════════════════════════════════════════');
+    console.log('[FFmpeg] Stopping all active video streams...');
+    console.log(`[FFmpeg] Active streams: ${this.processes.size}`);
     this.isShuttingDown = true;
     
-    const promises = Array.from(this.processes.keys()).map(streamName => 
-      this.stopStream(streamName)
-    );
+    if (this.processes.size === 0) {
+      console.log('[FFmpeg] No active streams to stop');
+      return;
+    }
+
+    const streamNames = Array.from(this.processes.keys());
+    console.log(`[FFmpeg] Stopping streams: [${streamNames.join(', ')}]`);
+    
+    // Stop all streams in parallel
+    const promises = streamNames.map(async (streamName) => {
+      try {
+        await this.stopStream(streamName);
+        console.log(`[FFmpeg] ✅ Stopped stream: ${streamName}`);
+      } catch (error) {
+        console.error(`[FFmpeg] ❌ Error stopping stream ${streamName}:`, error.message);
+      }
+    });
     
     await Promise.all(promises);
-    console.log('[FFmpeg] All streams stopped');
+    
+    // Force kill any remaining processes
+    for (const [streamName, processInfo] of this.processes.entries()) {
+      try {
+        if (processInfo.process && processInfo.process.pid) {
+          console.log(`[FFmpeg] 🔪 Force killing process ${processInfo.process.pid} for ${streamName}`);
+          process.kill(processInfo.process.pid, 'SIGKILL');
+        }
+      } catch (error) {
+        // Process already dead, ignore
+      }
+    }
+    
+    this.processes.clear();
+    console.log('[FFmpeg] ✅ All streams stopped successfully');
+    console.log('[FFmpeg] ════════════════════════════════════════════════════');
   }
 
   /**

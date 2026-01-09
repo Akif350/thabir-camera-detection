@@ -157,3 +157,87 @@ mongoose.connect(config.mongodbUri, {
     console.error('[MongoDB] ❌ Connection failed:', err.message);
     process.exit(1);
   });
+
+// ============================================
+// GRACEFUL SHUTDOWN HANDLERS
+// ============================================
+// These handlers ensure all video streams stop when system shuts down
+// Works on Windows, Linux, and macOS
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    console.log('[Shutdown] Already shutting down, forcing exit...');
+    process.exit(1);
+    return;
+  }
+
+  isShuttingDown = true;
+  console.log(`\n[Shutdown] ════════════════════════════════════════════════════`);
+  console.log(`[Shutdown] ${signal} received - Initiating graceful shutdown...`);
+  console.log(`[Shutdown] ════════════════════════════════════════════════════\n`);
+
+  try {
+    // Stop stream monitoring first
+    console.log('[Shutdown] 🛑 Stopping stream monitor...');
+    streamMonitor.stop();
+
+    // Stop all video streams - this will stop FFmpeg processes
+    console.log('[Shutdown] 🛑 Stopping all video streams...');
+    await ffmpegManager.stopAll();
+
+    // Update database - mark all cameras as not streaming
+    console.log('[Shutdown] 📝 Updating database - marking all streams as stopped...');
+    const Camera = require('./models/Camera');
+    await Camera.updateMany(
+      { streaming: true },
+      { 
+        streaming: false,
+        processId: null,
+        lastChecked: Date.now()
+      }
+    );
+    console.log('[Shutdown] ✅ Database updated - all streams marked as stopped');
+
+    // Close MongoDB connection
+    console.log('[Shutdown] 🔌 Closing MongoDB connection...');
+    await mongoose.connection.close();
+    console.log('[Shutdown] ✅ MongoDB connection closed');
+
+    console.log('\n[Shutdown] ════════════════════════════════════════════════════');
+    console.log('[Shutdown] ✅ GRACEFUL SHUTDOWN COMPLETE');
+    console.log('[Shutdown] ✅ All video streams stopped on all devices');
+    console.log('[Shutdown] ════════════════════════════════════════════════════\n');
+    
+    process.exit(0);
+  } catch (error) {
+    console.error('[Shutdown] ❌ Error during shutdown:', error);
+    process.exit(1);
+  }
+}
+
+// Standard shutdown signals (Linux, macOS, Windows with proper signal handling)
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Windows-specific shutdown handlers
+// Windows doesn't always send SIGTERM/SIGINT on shutdown, so we need these
+process.on('beforeExit', async (code) => {
+  if (!isShuttingDown && code === 0) {
+    console.log('[Shutdown] beforeExit event received');
+    await gracefulShutdown('beforeExit');
+  }
+});
+
+// Handle uncaught exceptions and unhandled rejections
+process.on('uncaughtException', async (error) => {
+  console.error('[Shutdown] ❌ Uncaught Exception:', error);
+  await gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('[Shutdown] ❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't shutdown on unhandled rejection, just log it
+  // await gracefulShutdown('unhandledRejection');
+});
