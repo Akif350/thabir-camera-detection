@@ -278,11 +278,7 @@ class FFmpegManager {
             return;
           }
 
-          // Process is valid and running - now verify stream is actually available on MediaMTX
-          console.log(`[FFmpeg ${streamName}] 🔍 Verifying stream is available on MediaMTX...`);
-          const isStreamAvailable = await this.verifyStreamAvailability(streamName, 5, 2000);
-          
-          // Process is valid and running - update database
+          // Process is valid and running - update database first
           processInfo.isValidated = true;
           streamValidated = true;
 
@@ -296,17 +292,26 @@ class FFmpegManager {
               }
             );
             
-            if (isStreamAvailable) {
-              console.log(`[FFmpeg ${streamName}] ✅ Stream validated and available on MediaMTX`);
-              console.log(`[FFmpeg ${streamName}] ✅ Stream marked as streaming in database`);
-              console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
-              console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
-              console.log(`[FFmpeg ${streamName}] ✅ Stream ready for all devices (mobile, network, etc.)`);
-            } else {
-              console.log(`[FFmpeg ${streamName}] ⚠️ Stream process running but MediaMTX endpoint not yet available`);
-              console.log(`[FFmpeg ${streamName}] ⚠️ Stream may still be initializing - will be available shortly`);
-              console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
-            }
+            console.log(`[FFmpeg ${streamName}] ✅ Stream validated and marked as streaming in database`);
+            console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
+            console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
+            
+            // Try to verify stream availability on MediaMTX (non-blocking)
+            // This is optional - stream will work even if verification fails
+            this.verifyStreamAvailability(streamName, 3, 3000).then((isAvailable) => {
+              if (isAvailable) {
+                console.log(`[FFmpeg ${streamName}] ✅ Stream verified available on MediaMTX`);
+                console.log(`[FFmpeg ${streamName}] ✅ Stream ready for all devices (mobile, network, etc.)`);
+              } else {
+                console.log(`[FFmpeg ${streamName}] ⚠️ Stream process running but MediaMTX endpoint verification pending`);
+                console.log(`[FFmpeg ${streamName}] 💡 Stream may still be initializing - will be available shortly`);
+                console.log(`[FFmpeg ${streamName}] 💡 Stream URL is ready: ${publicUrl}`);
+              }
+            }).catch((err) => {
+              // Verification failed but stream is still running
+              console.log(`[FFmpeg ${streamName}] ⚠️ Stream verification check failed: ${err.message}`);
+              console.log(`[FFmpeg ${streamName}] 💡 Stream is running and will be available shortly`);
+            });
             
             if (!resolvePromiseCalled) {
               resolvePromiseCalled = true;
@@ -504,8 +509,9 @@ class FFmpegManager {
   /**
    * Verify that stream is actually available on MediaMTX HTTP endpoint
    * This checks if the stream can be accessed via HTTP (HLS manifest)
+   * Returns true if available, false otherwise (non-blocking)
    */
-  async verifyStreamAvailability(streamName, maxRetries = 5, retryDelay = 2000) {
+  async verifyStreamAvailability(streamName, maxRetries = 3, retryDelay = 3000) {
     const publicUrl = this.getPublicUrl(streamName);
     const hlsUrl = `${publicUrl}/index.m3u8`;
     
@@ -513,7 +519,11 @@ class FFmpegManager {
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const isAvailable = await this.checkHttpEndpoint(hlsUrl);
+        const isAvailable = await Promise.race([
+          this.checkHttpEndpoint(hlsUrl),
+          new Promise((resolve) => setTimeout(() => resolve(false), 5000)) // 5 second timeout per attempt
+        ]);
+        
         if (isAvailable) {
           console.log(`[FFmpeg ${streamName}] ✅ Stream verified available on MediaMTX (attempt ${attempt}/${maxRetries})`);
           return true;
@@ -524,8 +534,9 @@ class FFmpegManager {
           await new Promise(resolve => setTimeout(resolve, retryDelay));
         }
       } catch (error) {
-        console.log(`[FFmpeg ${streamName}] ⚠️ Stream check failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
+        // Log error but continue retrying
         if (attempt < maxRetries) {
+          console.log(`[FFmpeg ${streamName}] ⚠️ Stream check failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
           await new Promise(resolve => setTimeout(resolve, retryDelay));
         }
       }
