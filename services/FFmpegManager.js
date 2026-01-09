@@ -15,9 +15,21 @@ class FFmpegManager {
    * @returns {Promise<string>} Public HTTP URL for the stream
    */
   async startStream(rtspSource, streamName) {
+    // Check if stream already running
     if (this.processes.has(streamName)) {
-      console.log(`[FFmpeg] Stream ${streamName} already running`);
-      return this.getPublicUrl(streamName);
+      const processInfo = this.processes.get(streamName);
+      // Verify process is actually alive
+      try {
+        if (processInfo.process.pid) {
+          process.kill(processInfo.process.pid, 0);
+          console.log(`[FFmpeg] Stream ${streamName} already running with PID ${processInfo.process.pid}`);
+          return this.getPublicUrl(streamName);
+        }
+      } catch (err) {
+        // Process died, remove from map and continue to restart
+        console.log(`[FFmpeg] Stream ${streamName} process dead, removing from map`);
+        this.processes.delete(streamName);
+      }
     }
 
     const pushTarget = `${config.mediamtx.getPushBase()}/${streamName}`;
@@ -54,6 +66,10 @@ class FFmpegManager {
     ];
 
     return new Promise((resolve, reject) => {
+      console.log(`[FFmpeg ${streamName}] 🚀 Starting stream process...`);
+      console.log(`[FFmpeg ${streamName}] 📹 Source: ${rtspSource}`);
+      console.log(`[FFmpeg ${streamName}] 📤 Push to: ${pushTarget}`);
+      
       const ffmpegProcess = spawn(config.ffmpeg.path, ffmpegArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true
@@ -66,13 +82,14 @@ class FFmpegManager {
         rtspSource,
         startTime: Date.now(),
         restartCount: 0,
-        isValidated: false  // Track if process has been validated
+        isValidated: false
       };
 
       this.processes.set(streamName, processInfo);
 
       let streamStarted = false;
       let streamValidated = false;
+      let resolvePromiseCalled = false;
 
       // Handle stdout
       ffmpegProcess.stdout.on('data', (data) => {
@@ -91,8 +108,11 @@ class FFmpegManager {
                                output.includes('Skipping invalid'));
         
         // Check for stream ready indicators
-        if (output.includes('Stream #0') || output.includes('Output #0') || output.includes('frame=') || output.includes('Stream mapping')) {
-          console.log(`[FFmpeg ${streamName}] ${output.trim()}`);
+        if (output.includes('Stream #0') || output.includes('Output #0') || 
+            output.includes('frame=') || output.includes('Stream mapping')) {
+          if (!isHevcWarning) {
+            console.log(`[FFmpeg ${streamName}] ${output.trim()}`);
+          }
           if ((output.includes('Stream #0') || output.includes('Stream mapping')) && !streamStarted) {
             streamStarted = true;
             console.log(`[FFmpeg ${streamName}] 📡 Stream processing detected - connection established`);
@@ -105,7 +125,8 @@ class FFmpegManager {
         }
         
         // Log errors (except HEVC warnings)
-        if ((output.includes('error') || output.includes('Error') || output.includes('failed') || output.includes('Failed')) && !isHevcWarning) {
+        if ((output.includes('error') || output.includes('Error') || 
+             output.includes('failed') || output.includes('Failed')) && !isHevcWarning) {
           console.error(`[FFmpeg ${streamName}] ❌ ${output.trim()}`);
         }
       });
@@ -132,19 +153,20 @@ class FFmpegManager {
           console.error(`[FFmpeg ${streamName}] Error updating database:`, error.message);
         }
 
-        // Auto-restart if not shutting down
-        if (!this.isShuttingDown) {
+        // Auto-restart if not shutting down and was validated
+        if (!this.isShuttingDown && processInfo.isValidated) {
           const maxRetries = 10;
           const retryDelay = Math.min(2000 * Math.pow(1.5, processInfo.restartCount || 0), 30000);
           
           if ((processInfo.restartCount || 0) < maxRetries) {
-            console.log(`[FFmpeg ${streamName}] Auto-restarting in ${retryDelay/1000} seconds... (Attempt ${(processInfo.restartCount || 0) + 1}/${maxRetries})`);
+            console.log(`[FFmpeg ${streamName}] Auto-restarting in ${retryDelay/1000}s... (Attempt ${(processInfo.restartCount || 0) + 1}/${maxRetries})`);
             
             setTimeout(async () => {
               try {
                 const camera = await Camera.findOne({ streamName, active: true });
                 if (camera) {
                   console.log(`[FFmpeg ${streamName}] 🔄 Restarting stream...`);
+                  processInfo.restartCount = (processInfo.restartCount || 0) + 1;
                   await this.startStream(camera.rtspUrl, streamName);
                 } else {
                   console.log(`[FFmpeg ${streamName}] Camera not found or inactive, stopping retries`);
@@ -178,7 +200,10 @@ class FFmpegManager {
           console.error(`[FFmpeg ${streamName}] DB update error:`, dbError.message);
         }
         
-        reject(error);
+        if (!resolvePromiseCalled) {
+          resolvePromiseCalled = true;
+          reject(error);
+        }
       });
 
       // Validation function - checks if process is actually running
@@ -191,7 +216,7 @@ class FFmpegManager {
 
           // Verify process is actually running (cross-platform check)
           try {
-            process.kill(ffmpegProcess.pid, 0); // Signal 0 checks if process exists without killing it
+            process.kill(ffmpegProcess.pid, 0); // Signal 0 checks if process exists
           } catch (err) {
             throw new Error(`Process ${ffmpegProcess.pid} does not exist`);
           }
@@ -208,21 +233,23 @@ class FFmpegManager {
         }
       };
 
-      // Wait for process to start and validate
+      // Wait for process to start
       setTimeout(async () => {
         if (!ffmpegProcess.pid) {
           console.error(`[FFmpeg ${streamName}] ❌ Process failed to start`);
           this.processes.delete(streamName);
-          reject(new Error('FFmpeg process failed to start'));
+          if (!resolvePromiseCalled) {
+            resolvePromiseCalled = true;
+            reject(new Error('FFmpeg process failed to start'));
+          }
           return;
         }
 
         console.log(`[FFmpeg ${streamName}] ✅ Started with PID ${ffmpegProcess.pid}`);
-        console.log(`[FFmpeg ${streamName}] 📹 Source: ${rtspSource}`);
         console.log(`[FFmpeg ${streamName}] 🌐 Public URL: ${publicUrl}`);
         console.log(`[FFmpeg ${streamName}] ⏳ Validating stream stability...`);
 
-        // Wait for MediaMTX to be ready
+        // Wait for MediaMTX to be ready and stream to stabilize
         setTimeout(async () => {
           // Validate process is still running
           const isValid = await validateProcess();
@@ -241,8 +268,11 @@ class FFmpegManager {
             } catch (err) {
               console.error(`[FFmpeg ${streamName}] DB update error:`, err.message);
             }
-            // Don't reject - let StreamMonitor handle restart
-            resolve(publicUrl);
+            // Resolve anyway - let StreamMonitor handle restart
+            if (!resolvePromiseCalled) {
+              resolvePromiseCalled = true;
+              resolve(publicUrl);
+            }
             return;
           }
 
@@ -263,22 +293,27 @@ class FFmpegManager {
             console.log(`[FFmpeg ${streamName}] ✅ Stream validated and marked as streaming in database`);
             console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
             console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
-            console.log(`[FFmpeg ${streamName}] ℹ️ Database update result:`, updateResult);
             
-            resolve(publicUrl);
+            if (!resolvePromiseCalled) {
+              resolvePromiseCalled = true;
+              resolve(publicUrl);
+            }
           } catch (err) {
             console.error(`[FFmpeg ${streamName}] ❌ Database update error:`, err.message);
             // Still resolve since stream is running
-            resolve(publicUrl);
+            if (!resolvePromiseCalled) {
+              resolvePromiseCalled = true;
+              resolve(publicUrl);
+            }
           }
         }, 12000); // 12 seconds total wait for MediaMTX to generate HLS
       }, 2000); // 2 seconds initial wait for process to start
 
       // Fallback timeout
       setTimeout(() => {
-        if (!streamValidated) {
+        if (!streamValidated && !resolvePromiseCalled) {
           console.log(`[FFmpeg ${streamName}] ⚠️ Validation timeout, resolving with warning`);
-          // Don't reject, just resolve - StreamMonitor will verify
+          resolvePromiseCalled = true;
           resolve(publicUrl);
         }
       }, 15000); // 15 second absolute timeout
@@ -291,22 +326,34 @@ class FFmpegManager {
   async stopStream(streamName) {
     const processInfo = this.processes.get(streamName);
     if (processInfo) {
-      console.log(`[FFmpeg] Stopping stream ${streamName}`);
-      processInfo.process.kill('SIGTERM');
+      console.log(`[FFmpeg] Stopping stream ${streamName} (PID: ${processInfo.process.pid})`);
+      
+      try {
+        processInfo.process.kill('SIGTERM');
+      } catch (err) {
+        console.error(`[FFmpeg] Error killing process:`, err.message);
+      }
+      
       this.processes.delete(streamName);
       
       // Update database
-      await Camera.updateOne(
-        { streamName },
-        { 
-          streaming: false,
-          processId: null,
-          lastChecked: Date.now()
-        }
-      );
+      try {
+        await Camera.updateOne(
+          { streamName },
+          { 
+            streaming: false,
+            processId: null,
+            lastChecked: Date.now()
+          }
+        );
+        console.log(`[FFmpeg] Database updated for ${streamName}: streaming = false`);
+      } catch (err) {
+        console.error(`[FFmpeg] DB update error:`, err.message);
+      }
       
       return true;
     }
+    console.log(`[FFmpeg] Stream ${streamName} not found in active processes`);
     return false;
   }
 
@@ -358,6 +405,18 @@ class FFmpegManager {
    * Get all active streams
    */
   getActiveStreams() {
+    // Clean up any dead processes first
+    for (const [streamName, processInfo] of this.processes.entries()) {
+      try {
+        if (processInfo.process.pid) {
+          process.kill(processInfo.process.pid, 0);
+        }
+      } catch (err) {
+        // Process is dead, remove it
+        this.processes.delete(streamName);
+      }
+    }
+    
     return Array.from(this.processes.keys());
   }
 
@@ -372,7 +431,7 @@ class FFmpegManager {
 // Singleton instance
 const ffmpegManager = new FFmpegManager();
 
-// Graceful shutdown
+// Graceful shutdown handlers
 process.on('SIGTERM', async () => {
   console.log('[System] SIGTERM received, shutting down gracefully...');
   await ffmpegManager.stopAll();

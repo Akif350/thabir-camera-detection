@@ -28,7 +28,7 @@ const swaggerOptions = {
   customSiteTitle: 'Thabir Streaming API Documentation'
 };
 
-// Swagger UI setup - Express handles arrays automatically
+// Swagger UI setup
 app.use('/api-docs', swaggerUi.serve);
 app.get('/api-docs', swaggerUi.setup(swaggerSpec, swaggerOptions));
 
@@ -74,10 +74,13 @@ app.get('/', (req, res) => {
  *                   example: 3
  */
 app.get('/health', (req, res) => {
+  const activeStreams = ffmpegManager.getActiveStreams();
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    activeStreams: streamMonitor.isRunning ? ffmpegManager.getActiveStreams().length : 0
+    activeStreams: activeStreams.length,
+    streams: activeStreams,
+    monitoring: streamMonitor.isRunning
   });
 });
 
@@ -101,67 +104,56 @@ app.use((req, res) => {
   });
 });
 
-// Connect to MongoDB
+// Connect to MongoDB and start server
+console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+console.log('🚀 THABIR STREAMING SERVER STARTING...');
+console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 console.log('[MongoDB] Attempting to connect...');
-console.log('[MongoDB] MONGODB_URI from env:', process.env.MONGODB_URI ? 'SET' : 'NOT SET');
-console.log('[MongoDB] Using URI:', config.mongodbUri.replace(/\/\/[^:]+:[^@]+@/, '//***:***@')); // Hide password in logs
+console.log('[MongoDB] MONGODB_URI:', process.env.MONGODB_URI ? '✅ SET' : '❌ NOT SET');
 
 mongoose.connect(config.mongodbUri, {
   useNewUrlParser: true,
   useUnifiedTopology: true
 })
-.then(() => {
-  console.log('[MongoDB] ✅ Connected successfully to Atlas');
+.then(async () => {
+  console.log('[MongoDB] ✅ Connected successfully');
   console.log(`[MongoDB] Database: ${mongoose.connection.name}`);
   
-  // Start the server - bind to 0.0.0.0 for Railway (accept external connections)
-  const host = '0.0.0.0'; // Listen on all interfaces for Railway
-  app.listen(config.port, host, () => {
-    console.log(`[Server] Running on ${host}:${config.port}`);
-    console.log(`[Server] Environment: ${config.nodeEnv}`);
-    console.log(`[MediaMTX] Host: ${config.mediamtx.host}:${config.mediamtx.rtspPort}`);
+  // Start the server
+  const host = '0.0.0.0'; // Listen on all interfaces
+  app.listen(config.port, host, async () => {
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`✅ SERVER RUNNING`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`🌐 Host: ${host}:${config.port}`);
+    console.log(`📦 Environment: ${config.nodeEnv}`);
+    console.log(`📹 MediaMTX: ${config.mediamtx.host}:${config.mediamtx.rtspPort}`);
+    console.log(`📚 API Docs: ${config.baseUrl}/api-docs`);
+    console.log(`💚 Health: ${config.baseUrl}/health`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
     
-    // Restore all active streams on startup - CRITICAL for 24/7 streaming
-    streamMonitor.restoreStreams().then(() => {
-      // Start monitoring after restoration - ensures streams never stop
+    try {
+      // CRITICAL: Restore all active streams on startup
+      console.log('[Server] 🔄 Initiating stream restoration...\n');
+      await streamMonitor.restoreStreams();
+      
+      // Start monitoring - this ensures 24/7 streaming
+      console.log('\n[Server] 🔄 Starting stream monitoring...');
       streamMonitor.start();
-      console.log('[Monitor] ✅ Stream monitoring started - 24/7 streaming enabled');
-      console.log('[Monitor] Streams will auto-restart every 15 seconds if stopped');
-    }).catch((error) => {
-      console.error('[Monitor] Error starting monitor:', error);
-      // Still start monitoring even if restore fails
-      streamMonitor.start();
+      
+      console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('✅ ALL SYSTEMS READY - 24/7 STREAMING ENABLED');
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('📺 Active cameras will stream continuously');
+      console.log('🔄 Auto-restart every 15 seconds if streams stop');
+      console.log('🔌 Streams restore automatically on server restart');
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    } catch (error) {
+      console.error('[Server] ❌ Error during startup:', error.message);
+    }
     });
+  })
+  .catch((err) => {
+    console.error('[MongoDB] ❌ Connection failed:', err.message);
+    process.exit(1);
   });
-})
-.catch((error) => {
-  console.error('[MongoDB] Connection error:', error);
-  process.exit(1);
-});
-
-// Handle MongoDB connection events
-mongoose.connection.on('error', (err) => {
-  console.error('[MongoDB] Error:', err);
-});
-
-mongoose.connection.on('disconnected', () => {
-  console.warn('[MongoDB] Disconnected');
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('[Server] SIGTERM received, shutting down...');
-  await streamMonitor.stop();
-  await require('./services/FFmpegManager').stopAll();
-  mongoose.connection.close();
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  console.log('[Server] SIGINT received, shutting down...');
-  await streamMonitor.stop();
-  await require('./services/FFmpegManager').stopAll();
-  mongoose.connection.close();
-  process.exit(0);
-});
-
