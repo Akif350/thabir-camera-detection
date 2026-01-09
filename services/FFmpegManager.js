@@ -1,4 +1,6 @@
 const { spawn } = require('child_process');
+const http = require('http');
+const https = require('https');
 const config = require('../config');
 const Camera = require('../models/Camera');
 
@@ -276,6 +278,10 @@ class FFmpegManager {
             return;
           }
 
+          // Process is valid and running - now verify stream is actually available on MediaMTX
+          console.log(`[FFmpeg ${streamName}] 🔍 Verifying stream is available on MediaMTX...`);
+          const isStreamAvailable = await this.verifyStreamAvailability(streamName, 5, 2000);
+          
           // Process is valid and running - update database
           processInfo.isValidated = true;
           streamValidated = true;
@@ -290,9 +296,17 @@ class FFmpegManager {
               }
             );
             
-            console.log(`[FFmpeg ${streamName}] ✅ Stream validated and marked as streaming in database`);
-            console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
-            console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
+            if (isStreamAvailable) {
+              console.log(`[FFmpeg ${streamName}] ✅ Stream validated and available on MediaMTX`);
+              console.log(`[FFmpeg ${streamName}] ✅ Stream marked as streaming in database`);
+              console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
+              console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
+              console.log(`[FFmpeg ${streamName}] ✅ Stream ready for all devices (mobile, network, etc.)`);
+            } else {
+              console.log(`[FFmpeg ${streamName}] ⚠️ Stream process running but MediaMTX endpoint not yet available`);
+              console.log(`[FFmpeg ${streamName}] ⚠️ Stream may still be initializing - will be available shortly`);
+              console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
+            }
             
             if (!resolvePromiseCalled) {
               resolvePromiseCalled = true;
@@ -306,7 +320,7 @@ class FFmpegManager {
               resolve(publicUrl);
             }
           }
-        }, 12000); // 12 seconds total wait for MediaMTX to generate HLS
+        }, 15000); // 15 seconds total wait for MediaMTX to generate HLS and be ready
       }, 2000); // 2 seconds initial wait for process to start
 
       // Fallback timeout
@@ -485,6 +499,111 @@ class FFmpegManager {
    */
   getProcessInfo(streamName) {
     return this.processes.get(streamName);
+  }
+
+  /**
+   * Verify that stream is actually available on MediaMTX HTTP endpoint
+   * This checks if the stream can be accessed via HTTP (HLS manifest)
+   */
+  async verifyStreamAvailability(streamName, maxRetries = 5, retryDelay = 2000) {
+    const publicUrl = this.getPublicUrl(streamName);
+    const hlsUrl = `${publicUrl}/index.m3u8`;
+    
+    console.log(`[FFmpeg ${streamName}] 🔍 Verifying stream availability: ${hlsUrl}`);
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const isAvailable = await this.checkHttpEndpoint(hlsUrl);
+        if (isAvailable) {
+          console.log(`[FFmpeg ${streamName}] ✅ Stream verified available on MediaMTX (attempt ${attempt}/${maxRetries})`);
+          return true;
+        }
+        
+        if (attempt < maxRetries) {
+          console.log(`[FFmpeg ${streamName}] ⏳ Stream not yet available, retrying in ${retryDelay/1000}s... (attempt ${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+      } catch (error) {
+        console.log(`[FFmpeg ${streamName}] ⚠️ Stream check failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+      }
+    }
+    
+    console.log(`[FFmpeg ${streamName}] ⚠️ Stream not verified after ${maxRetries} attempts - may still be initializing`);
+    return false;
+  }
+
+  /**
+   * Check if HTTP endpoint is accessible
+   * Tries HEAD first, then GET if HEAD fails
+   */
+  async checkHttpEndpoint(url) {
+    return new Promise((resolve) => {
+      const urlObj = new URL(url);
+      const isHttps = urlObj.protocol === 'https:';
+      const httpModule = isHttps ? https : http;
+      
+      const makeRequest = (method) => {
+        const options = {
+          hostname: urlObj.hostname,
+          port: urlObj.port || (isHttps ? 443 : 80),
+          path: urlObj.pathname + urlObj.search,
+          method: method,
+          timeout: 5000
+        };
+
+        const req = httpModule.request(options, (res) => {
+          // Stream is available if we get 200 OK
+          // 404 means stream not found (not available yet)
+          // Other 4xx/5xx also mean not available
+          const isAvailable = res.statusCode === 200;
+          
+          // For GET requests, we need to consume the response body
+          if (method === 'GET') {
+            let dataReceived = false;
+            res.on('data', (chunk) => {
+              dataReceived = true;
+            });
+            res.on('end', () => {
+              resolve(isAvailable && dataReceived);
+            });
+          } else {
+            // For HEAD, just check status
+            res.on('data', () => {}); // Consume response
+            res.on('end', () => {
+              resolve(isAvailable);
+            });
+          }
+        });
+
+        req.on('error', (error) => {
+          // Connection error means stream is not available
+          if (method === 'HEAD') {
+            // Try GET as fallback
+            makeRequest('GET');
+          } else {
+            resolve(false);
+          }
+        });
+
+        req.on('timeout', () => {
+          req.destroy();
+          if (method === 'HEAD') {
+            // Try GET as fallback
+            makeRequest('GET');
+          } else {
+            resolve(false);
+          }
+        });
+
+        req.end();
+      };
+
+      // Start with HEAD request
+      makeRequest('HEAD');
+    });
   }
 }
 

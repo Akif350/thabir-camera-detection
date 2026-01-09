@@ -194,16 +194,20 @@ class StreamMonitor {
           
           try {
             await ffmpegManager.startStream(camera.rtspUrl, camera.streamName);
-            console.log(`[Monitor] ⏳ Waiting for stream to stabilize (3 seconds)...`);
+            console.log(`[Monitor] ⏳ Waiting for stream to stabilize and verify MediaMTX availability...`);
             
-            // Wait for stream to stabilize (reduced from 5 to 3 seconds for faster restoration)
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            // Wait for stream to stabilize and verify it's available on MediaMTX
+            await new Promise(resolve => setTimeout(resolve, 5000));
             
             // Verify stream is actually running
             const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
             const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
             
             if (isRunning && processInfo) {
+              // Additional check: verify stream is available on MediaMTX
+              console.log(`[Monitor] 🔍 Verifying stream availability on MediaMTX...`);
+              const isAvailable = await ffmpegManager.verifyStreamAvailability(camera.streamName, 3, 2000);
+              
               camera.streaming = true;
               camera.processId = processInfo.process.pid;
               camera.publicUrl = ffmpegManager.getPublicUrl(camera.streamName);
@@ -214,7 +218,13 @@ class StreamMonitor {
               console.log(`[Monitor] ✅ SUCCESS - Stream ${camera.streamName} running with PID ${processInfo.process.pid}`);
               console.log(`[Monitor] 🌐 Public URL: ${camera.publicUrl}`);
               console.log(`[Monitor] 📺 HLS: ${camera.publicUrl}/index.m3u8`);
-              console.log(`[Monitor] ✅ Video link restored and ready for all devices (mobile, network, etc.)`);
+              if (isAvailable) {
+                console.log(`[Monitor] ✅ Stream verified available on MediaMTX`);
+                console.log(`[Monitor] ✅ Video link restored and ready for all devices (mobile, network, etc.)`);
+              } else {
+                console.log(`[Monitor] ⚠️ Stream process running but MediaMTX endpoint may still be initializing`);
+                console.log(`[Monitor] 💡 Stream will be available shortly - monitoring will verify in next cycle`);
+              }
             } else {
               camera.streaming = false;
               camera.processId = null;
