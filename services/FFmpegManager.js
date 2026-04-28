@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const http = require('http');
 const https = require('https');
+const mongoose = require('mongoose');
 const config = require('../config');
 const Camera = require('../models/Camera');
 
@@ -8,6 +9,14 @@ class FFmpegManager {
   constructor() {
     this.processes = new Map(); // Map<streamName, process>
     this.isShuttingDown = false;
+  }
+
+  isMongoEnabled() {
+    const disabled =
+      String(process.env.DISABLE_MONGODB || '').toLowerCase() === 'true' ||
+      String(process.env.SKIP_MONGODB || '').toLowerCase() === 'true';
+    if (disabled) return false;
+    return mongoose.connection?.readyState === 1;
   }
 
   /**
@@ -140,19 +149,21 @@ class FFmpegManager {
         // Remove from active processes
         this.processes.delete(streamName);
 
-        // Update database - mark as not streaming
-        try {
-          await Camera.updateOne(
-            { streamName },
-            { 
-              streaming: false,
-              processId: null,
-              lastChecked: Date.now()
-            }
-          );
-          console.log(`[FFmpeg ${streamName}] Database updated: streaming = false`);
-        } catch (error) {
-          console.error(`[FFmpeg ${streamName}] Error updating database:`, error.message);
+        if (this.isMongoEnabled()) {
+          // Update database - mark as not streaming
+          try {
+            await Camera.updateOne(
+              { streamName },
+              {
+                streaming: false,
+                processId: null,
+                lastChecked: Date.now()
+              }
+            );
+            console.log(`[FFmpeg ${streamName}] Database updated: streaming = false`);
+          } catch (error) {
+            console.error(`[FFmpeg ${streamName}] Error updating database:`, error.message);
+          }
         }
 
         // Auto-restart if not shutting down and was validated
@@ -165,6 +176,11 @@ class FFmpegManager {
             
             setTimeout(async () => {
               try {
+                if (!this.isMongoEnabled()) {
+                  console.log(`[FFmpeg ${streamName}] MongoDB disabled - stopping retries`);
+                  return;
+                }
+
                 const camera = await Camera.findOne({ streamName, active: true });
                 if (camera) {
                   console.log(`[FFmpeg ${streamName}] 🔄 Restarting stream...`);
@@ -188,18 +204,20 @@ class FFmpegManager {
         console.error(`[FFmpeg ${streamName}] Process error:`, error.message);
         this.processes.delete(streamName);
         
-        // Update database
-        try {
-          await Camera.updateOne(
-            { streamName },
-            { 
-              streaming: false,
-              processId: null,
-              lastChecked: Date.now()
-            }
-          );
-        } catch (dbError) {
-          console.error(`[FFmpeg ${streamName}] DB update error:`, dbError.message);
+        if (this.isMongoEnabled()) {
+          // Update database
+          try {
+            await Camera.updateOne(
+              { streamName },
+              {
+                streaming: false,
+                processId: null,
+                lastChecked: Date.now()
+              }
+            );
+          } catch (dbError) {
+            console.error(`[FFmpeg ${streamName}] DB update error:`, dbError.message);
+          }
         }
         
         if (!resolvePromiseCalled) {
@@ -258,17 +276,19 @@ class FFmpegManager {
           
           if (!isValid) {
             console.error(`[FFmpeg ${streamName}] ❌ Process validation failed - stream not stable`);
-            try {
-              await Camera.updateOne(
-                { streamName },
-                { 
-                  streaming: false,
-                  processId: null,
-                  lastChecked: Date.now()
-                }
-              );
-            } catch (err) {
-              console.error(`[FFmpeg ${streamName}] DB update error:`, err.message);
+            if (this.isMongoEnabled()) {
+              try {
+                await Camera.updateOne(
+                  { streamName },
+                  {
+                    streaming: false,
+                    processId: null,
+                    lastChecked: Date.now()
+                  }
+                );
+              } catch (err) {
+                console.error(`[FFmpeg ${streamName}] DB update error:`, err.message);
+              }
             }
             // Resolve anyway - let StreamMonitor handle restart
             if (!resolvePromiseCalled) {
@@ -283,16 +303,19 @@ class FFmpegManager {
           streamValidated = true;
 
           try {
-            const updateResult = await Camera.updateOne(
-              { streamName },
-              { 
-                streaming: true,
-                processId: ffmpegProcess.pid,
-                lastChecked: Date.now()
-              }
-            );
-            
-            console.log(`[FFmpeg ${streamName}] ✅ Stream validated and marked as streaming in database`);
+            if (this.isMongoEnabled()) {
+              await Camera.updateOne(
+                { streamName },
+                {
+                  streaming: true,
+                  processId: ffmpegProcess.pid,
+                  lastChecked: Date.now()
+                }
+              );
+
+              console.log(`[FFmpeg ${streamName}] ✅ Stream validated and marked as streaming in database`);
+            }
+
             console.log(`[FFmpeg ${streamName}] 📺 Stream URL: ${publicUrl}`);
             console.log(`[FFmpeg ${streamName}] 📺 HLS Manifest: ${publicUrl}/index.m3u8`);
             
@@ -385,18 +408,20 @@ class FFmpegManager {
       this.processes.delete(streamName);
       
       // Update database - mark stream as stopped
-      try {
-        await Camera.updateOne(
-          { streamName },
-          { 
-            streaming: false,
-            processId: null,
-            lastChecked: Date.now()
-          }
-        );
-        console.log(`[FFmpeg] ✅ Database updated for ${streamName}: streaming = false`);
-      } catch (err) {
-        console.error(`[FFmpeg] ❌ DB update error:`, err.message);
+      if (this.isMongoEnabled()) {
+        try {
+          await Camera.updateOne(
+            { streamName },
+            {
+              streaming: false,
+              processId: null,
+              lastChecked: Date.now()
+            }
+          );
+          console.log(`[FFmpeg] ✅ Database updated for ${streamName}: streaming = false`);
+        } catch (err) {
+          console.error(`[FFmpeg] ❌ DB update error:`, err.message);
+        }
       }
       
       return true;

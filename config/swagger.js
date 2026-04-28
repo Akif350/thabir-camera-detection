@@ -19,12 +19,12 @@ const options = {
     },
     servers: [
       {
-        url: 'https://thabir-camera-detection-production.up.railway.app',
-        description: 'Railway Production Server'
-      },
-      {
         url: `http://localhost:${config.port}`,
         description: 'Development server'
+      },
+      {
+        url: config.baseUrl,
+        description: 'Configured server base URL'
       },
       {
         url: 'https://api.thabir.ai',

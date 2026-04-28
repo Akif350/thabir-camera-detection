@@ -4,6 +4,7 @@ const Camera = require('../models/Camera');
 const ffmpegManager = require('../services/FFmpegManager');
 const axios = require('axios');
 const config = require('../config');
+const inMemoryStore = require('../services/InMemoryStore');
 
 /**
  * @swagger
@@ -98,27 +99,48 @@ router.post('/add', async (req, res) => {
     const streamName = `cam_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const publicUrl = ffmpegManager.getPublicUrl(streamName);
 
-    // Create camera record
-    const camera = new Camera({
-      name: name || `Camera_${Date.now()}`,
-      rtspUrl,
-      workspaceId: finalWorkspaceId,
-      streamName,
-      publicUrl,
-      iceCastUrl: publicUrl,
-      isIceCastUrl: true,
-      manufacturer: manufacturer || '',
-      region: region || '',
-      country: country || '',
-      postalCode: postalCode || '',
-      ipAddress: ipAddress || '',
-      nvrUsername: nvrUsername || '',
-      nvrPassword: nvrPassword || '',
-      active: true,
-      streaming: false
-    });
+    const disableMongo =
+      String(process.env.DISABLE_MONGODB || '').toLowerCase() === 'true' ||
+      String(process.env.SKIP_MONGODB || '').toLowerCase() === 'true';
 
-    await camera.save();
+    let camera = null;
+    if (!disableMongo) {
+      // Create camera record
+      camera = new Camera({
+        name: name || `Camera_${Date.now()}`,
+        rtspUrl,
+        workspaceId: finalWorkspaceId,
+        streamName,
+        publicUrl,
+        iceCastUrl: publicUrl,
+        isIceCastUrl: true,
+        manufacturer: manufacturer || '',
+        region: region || '',
+        country: country || '',
+        postalCode: postalCode || '',
+        ipAddress: ipAddress || '',
+        nvrUsername: nvrUsername || '',
+        nvrPassword: nvrPassword || '',
+        active: true,
+        streaming: false
+      });
+
+      await camera.save();
+    }
+    if (disableMongo) {
+      inMemoryStore.upsertCamera({
+        id: streamName,
+        name: name || `Camera_${Date.now()}`,
+        rtspUrl,
+        workspaceId: finalWorkspaceId,
+        streamName,
+        publicUrl,
+        active: true,
+        streaming: false,
+        createdAt: Date.now(),
+        lastChecked: Date.now()
+      });
+    }
 
     // Start streaming IMMEDIATELY
     console.log(`[API] 🚀 Starting stream for ${streamName}...`);
@@ -126,10 +148,20 @@ router.post('/add', async (req, res) => {
     
     try {
       const actualPublicUrl = await ffmpegManager.startStream(rtspUrl, streamName);
-      camera.publicUrl = actualPublicUrl;
-      camera.iceCastUrl = actualPublicUrl;
-      camera.streaming = true;
-      await camera.save();
+      if (camera) {
+        camera.publicUrl = actualPublicUrl;
+        camera.iceCastUrl = actualPublicUrl;
+        camera.streaming = true;
+        await camera.save();
+      }
+      if (disableMongo) {
+        inMemoryStore.upsertCamera({
+          streamName,
+          publicUrl: actualPublicUrl,
+          streaming: true,
+          lastChecked: Date.now()
+        });
+      }
       console.log(`[API] ✅ Stream started successfully: ${actualPublicUrl}`);
     } catch (streamError) {
       console.error(`[API] ❌ Failed to start stream for ${streamName}:`, streamError.message);
@@ -151,11 +183,11 @@ router.post('/add', async (req, res) => {
       success: true,
       message: 'Camera added and streaming started',
       camera: {
-        id: camera._id,
-        name: camera.name,
-        streamName: camera.streamName,
-        publicUrl: camera.publicUrl,
-        streaming: camera.streaming
+        id: camera?._id,
+        name: camera?.name || (name || `Camera_${Date.now()}`),
+        streamName,
+        publicUrl: camera?.publicUrl || publicUrl,
+        streaming: camera?.streaming || ffmpegManager.isStreamRunning(streamName)
       }
     });
 
@@ -200,20 +232,25 @@ router.post('/add', async (req, res) => {
 router.get('/list', async (req, res) => {
   try {
     const { workspaceId } = req.query;
-    const query = workspaceId ? { workspaceId } : {};
+    const disableMongo =
+      String(process.env.DISABLE_MONGODB || '').toLowerCase() === 'true' ||
+      String(process.env.SKIP_MONGODB || '').toLowerCase() === 'true';
 
-    const cameras = await Camera.find(query).sort({ createdAt: -1 });
+    const cameras = disableMongo
+      ? inMemoryStore.listCameras({ workspaceId })
+      : await Camera.find(workspaceId ? { workspaceId } : {}).sort({ createdAt: -1 });
 
     // Update streaming status from active processes (REAL-TIME)
     const camerasWithStatus = cameras.map(camera => {
-      const isRunning = ffmpegManager.isStreamRunning(camera.streamName);
-      const processInfo = ffmpegManager.getProcessInfo(camera.streamName);
+      const streamName = camera.streamName;
+      const isRunning = ffmpegManager.isStreamRunning(streamName);
+      const processInfo = ffmpegManager.getProcessInfo(streamName);
       
       return {
-        id: camera._id,
+        id: camera._id || camera.id,
         name: camera.name,
         rtspUrl: camera.rtspUrl,
-        streamName: camera.streamName,
+        streamName,
         publicUrl: camera.publicUrl,
         active: camera.active,
         streaming: isRunning || camera.streaming,
@@ -240,6 +277,60 @@ router.get('/list', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to list cameras',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/camera/clear:
+ *   post:
+ *     summary: Stop all streams and clear stored links
+ *     description: Stops all active FFmpeg streams and clears in-memory camera list (and DB flags if MongoDB is enabled).
+ *     tags: [Camera]
+ *     responses:
+ *       200:
+ *         description: Cleared successfully
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/clear', async (req, res) => {
+  try {
+    const disableMongo =
+      String(process.env.DISABLE_MONGODB || '').toLowerCase() === 'true' ||
+      String(process.env.SKIP_MONGODB || '').toLowerCase() === 'true';
+
+    await ffmpegManager.stopAll();
+    const clearedInMemory = inMemoryStore.clear();
+
+    let clearedDb = 0;
+    if (!disableMongo) {
+      const result = await Camera.updateMany(
+        {},
+        {
+          active: false,
+          streaming: false,
+          processId: null,
+          lastChecked: Date.now()
+        }
+      );
+      clearedDb = result?.modifiedCount ?? result?.nModified ?? 0;
+    }
+
+    res.json({
+      success: true,
+      message: 'Cleared all streams/links',
+      cleared: {
+        inMemory: clearedInMemory,
+        db: clearedDb
+      }
+    });
+  } catch (error) {
+    console.error('[API] Error clearing cameras:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to clear cameras',
       error: error.message
     });
   }
